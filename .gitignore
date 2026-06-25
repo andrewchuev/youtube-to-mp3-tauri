@@ -1,0 +1,9 @@
+.idea
+node_modules/
+dist/
+.vscode/
+.DS_Store
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+*.log

@@ -1,0 +1,181 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+          # Use macOS 13 (Intel) for x86_64 — avoids cross-compilation on
+          # the arm64 macos-latest runner (macOS 15 Sequoia, Apple Silicon).
+          - os: macos-13
+            target: x86_64-apple-darwin
+            macos_deployment_target: '10.13'
+
+          - os: macos-14
+            target: aarch64-apple-darwin
+            macos_deployment_target: '11.0'
+
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # ── Version sync ────────────────────────────────────────────────────────
+      # Strip leading 'v' from the tag (v1.2.3 → 1.2.3) and write it into
+      # tauri.conf.json so the installer and About dialog show the correct version.
+
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const conf = JSON.parse(fs.readFileSync(p, 'utf8'));
+            conf.version = '${VERSION}';
+            fs.writeFileSync(p, JSON.stringify(conf, null, 2) + '\n');
+          "
+          echo "Version set to ${VERSION}"
+
+      # ── Linux system dependencies ────────────────────────────────────────────
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # ── yt-dlp ───────────────────────────────────────────────────────────────
+
+      - name: Download yt-dlp (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+            -OutFile "src-tauri/binaries/yt-dlp-x86_64-pc-windows-msvc.exe"
+
+      - name: Download yt-dlp (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -fsSL \
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" \
+            -o "src-tauri/binaries/yt-dlp-${{ matrix.target }}"
+          chmod +x "src-tauri/binaries/yt-dlp-${{ matrix.target }}"
+
+      - name: Download yt-dlp (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL \
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" \
+            -o "src-tauri/binaries/yt-dlp-x86_64-unknown-linux-gnu"
+          chmod +x "src-tauri/binaries/yt-dlp-x86_64-unknown-linux-gnu"
+
+      # ── ffmpeg ───────────────────────────────────────────────────────────────
+
+      - name: Download ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $exe = Get-ChildItem -Path ffmpeg_tmp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          Copy-Item $exe.FullName "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
+          Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
+
+      - name: Download ffmpeg (macOS x86_64)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o ffmpeg.zip
+          unzip -j ffmpeg.zip ffmpeg -d ffmpeg_tmp
+          cp ffmpeg_tmp/ffmpeg "src-tauri/binaries/ffmpeg-x86_64-apple-darwin"
+          chmod +x "src-tauri/binaries/ffmpeg-x86_64-apple-darwin"
+          rm -rf ffmpeg.zip ffmpeg_tmp
+
+      - name: Download ffmpeg (macOS arm64)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg
+          cp "$(brew --prefix)/bin/ffmpeg" "src-tauri/binaries/ffmpeg-aarch64-apple-darwin"
+          chmod +x "src-tauri/binaries/ffmpeg-aarch64-apple-darwin"
+
+      - name: Download ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz" \
+            -o ffmpeg.tar.xz
+          tar -xJf ffmpeg.tar.xz
+          cp ffmpeg-master-latest-linux64-lgpl/bin/ffmpeg \
+            "src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu"
+          chmod +x "src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu"
+          rm -rf ffmpeg.tar.xz ffmpeg-master-latest-linux64-lgpl
+
+      # ── build ─────────────────────────────────────────────────────────────────
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set deployment target for macOS to ensure the correct SDK is used.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+          # Explicitly opt out of code signing when no certificate is configured.
+          # Remove this and add APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY secrets
+          # to the repository to produce signed builds.
+          APPLE_SIGNING_IDENTITY: '-'
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: YTMP3 Desktop ${{ github.ref_name }}
+          releaseBody: |
+            ## Downloads
+
+            | Platform | Installer |
+            |----------|-----------|
+            | Windows 10 / 11 | `.msi` |
+            | macOS Intel | `.dmg` |
+            | macOS Apple Silicon | `.dmg` |
+            | Linux | `.AppImage` · `.deb` |
+
+            > **macOS note:** if Gatekeeper blocks the app, right-click → Open.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}
